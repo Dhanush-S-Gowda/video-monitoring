@@ -113,9 +113,7 @@ class ObjectTracker:
             cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
             
             # Draw label
-            label = f"ID:{track_id} {class_name} {conf:.2f}"
-            cv2.putText(annotated, label, (x1, y1 - 10), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            pass
         
         return annotated
     

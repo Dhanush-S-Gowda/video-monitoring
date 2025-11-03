@@ -9,8 +9,7 @@ import numpy as np
 import time
 import argparse
 from datetime import datetime
-from typing import Dict, Optional
-import threading
+from typing import Dict
 import queue
 
 from object_tracker import ObjectTracker
@@ -19,57 +18,44 @@ from database_manager import DatabaseManager
 
 
 class IntegratedSystem:
-    """
-    Main system that integrates object tracking, face recognition, and logging.
-    """
-    
-    def __init__(self, 
-                 yolo_model_path: str = "best.pt",
-                 face_model_path: str = "keras_model.h5",
-                 labels_path: str = "labels.txt",
-                 db_path: str = "presence_log.db",
-                 reappear_threshold: int = 30,
-                 cleanup_interval: int = 60,
-                 camera_index: int = 0):
-        """
-        Initialize the integrated system.
-        
-        Args:
-            yolo_model_path: Path to YOLO model
-            face_model_path: Path to face recognition model
-            labels_path: Path to labels file
-            db_path: Path to SQLite database
-            reappear_threshold: Threshold for re-appearance detection (seconds)
-            cleanup_interval: Interval for cleaning up inactive tracks (seconds)
-            camera_index: Camera device index
-        """
+    def __init__(self,
+                 yolo_model_path="best.pt",
+                 face_model_path="keras_model.h5",
+                 labels_path="labels.txt",
+                 db_path="presence_log.db",
+                 reappear_threshold=30,
+                 cleanup_interval=60,
+                 camera_index=0):
         print("Initializing Integrated Person Tracking System...")
         print("=" * 60)
-        
-        # Initialize components
+
+        # Load Object Tracker
         print("Loading Object Tracker...")
         self.tracker = ObjectTracker(model_path=yolo_model_path)
-        
+
+        # Load Face Recognition Module
         print("Loading Face Recognition Module...")
         self.face_recognizer = FaceRecognitionModule(
             model_path=face_model_path,
             labels_path=labels_path
         )
-        
+
+        # Load labels (map IDs to names)
+        print("Loading Labels...")
+        self.labels = self._load_labels(labels_path)
+
+        # Database Manager
         print("Initializing Database Manager...")
-        self.db = DatabaseManager(
-            db_path=db_path,
-            reappear_threshold=reappear_threshold
-        )
-        
+        self.db = DatabaseManager(db_path=db_path, reappear_threshold=reappear_threshold)
+
         # Camera
         self.camera_index = camera_index
         self.cap = None
-        
-        # Processing settings
+
+        # Settings
         self.cleanup_interval = cleanup_interval
         self.last_cleanup = time.time()
-        
+
         # Statistics
         self.stats = {
             'frames_processed': 0,
@@ -78,297 +64,198 @@ class IntegratedSystem:
             'body_matches': 0,
             'unknown': 0
         }
-        
-        # Threading
+
         self.running = False
         self.processing_queue = queue.Queue(maxsize=5)
-        
+
         print("=" * 60)
-        print("System initialized successfully!")
-        print()
-    
-    def start_camera(self) -> bool:
-        """
-        Start the camera capture.
-        
-        Returns:
-            True if successful, False otherwise
-        """
+        print("System initialized successfully!\n")
+
+    def _load_labels(self, labels_path):
+        """Load label names from labels.txt"""
+        try:
+            with open(labels_path, 'r') as f:
+                labels = [line.strip() for line in f.readlines() if line.strip()]
+            print(f"Loaded {len(labels)} labels: {labels}")
+            return labels
+        except Exception as e:
+            print(f"Error loading labels file: {e}")
+            return []
+
+    def start_camera(self):
         self.cap = cv2.VideoCapture(self.camera_index)
-        
         if not self.cap.isOpened():
             print(f"Error: Cannot open camera at index {self.camera_index}")
             return False
-        
-        # Set camera properties for better performance
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         self.cap.set(cv2.CAP_PROP_FPS, 30)
-        
-        print(f"Camera opened successfully")
+        print("Camera opened successfully")
         return True
-    
-    def process_detections(self, detections: list):
-        """
-        Process detections from object tracker through face recognition and logging.
-        
-        Args:
-            detections: List of detection dictionaries from ObjectTracker
-        """
+
+    def process_detections(self, detections):
         for det in detections:
             track_id = det['track_id']
             cropped_img = det['cropped_img']
             class_name = det['class_name']
-            
-            # Only process person detections
+
             if class_name.lower() != 'person':
                 continue
-            
+
             self.stats['detections'] += 1
-            
-            # Run face recognition
-            recognition_result = self.face_recognizer.process_detection(
-                cropped_img, track_id
-            )
-            
+
+            recognition_result = self.face_recognizer.process_detection(cropped_img, track_id)
             identity = recognition_result.get('identity')
             method = recognition_result.get('method')
-            
-            # Update statistics
+
             if method == 'face':
                 self.stats['faces_recognized'] += 1
             elif method == 'body':
                 self.stats['body_matches'] += 1
             elif method == 'unknown':
                 self.stats['unknown'] += 1
-            
-            # Log to database if identity is known
+
+            # Map identity (ID) to name if found
+            display_name = "Unknown"
+            if identity is not None and isinstance(identity, int) and 0 <= identity < len(self.labels):
+                display_name = self.labels[identity]
+            elif isinstance(identity, str):
+                display_name = identity
+
+            # Log detection if identified
             if identity:
                 try:
-                    log_id = self.db.log_detection(identity, track_id)
-                    print(f"[LOG] Track {track_id} -> {identity} (method: {method}, log_id: {log_id})")
+                    self.db.log_detection(display_name, track_id)
+                    print(f"[LOG] Track {track_id} -> {display_name} ({method})")
                 except Exception as e:
                     print(f"Error logging detection: {e}")
             else:
-                print(f"[TRACK] Track {track_id} -> Unknown person (method: {method})")
-    
+                print(f"[TRACK] Track {track_id} -> Unknown person ({method})")
+
+            # Draw name on bounding box (in ObjectTracker or here)
+            det['display_name'] = display_name
+
     def cleanup_inactive_tracks(self):
-        """Periodically cleanup inactive tracks."""
         current_time = time.time()
-        
         if current_time - self.last_cleanup > self.cleanup_interval:
-            print("\n[CLEANUP] Running cleanup of inactive tracks...")
+            print("\n[CLEANUP] Cleaning inactive tracks...")
             self.db.cleanup_inactive_tracks(timeout=self.cleanup_interval)
             self.tracker.cleanup_stale_tracks(timeout=self.cleanup_interval)
             self.last_cleanup = current_time
-    
-    def draw_ui(self, frame: np.ndarray, detections: list) -> np.ndarray:
-        """
-        Draw UI elements on frame.
-        
-        Args:
-            frame: Original frame
-            detections: List of detections
-            
-        Returns:
-            Annotated frame
-        """
-        # Start with annotated frame from tracker
+
+    def draw_ui(self, frame, detections):
         annotated = self.tracker.get_annotated_frame(frame, detections)
-        
-        # Add system info overlay
+
+        # Draw names above bounding boxes
+        for det in detections:
+            if 'bbox' in det and 'display_name' in det:
+                x1, y1, x2, y2 = det['bbox']
+                name = det['display_name']
+                cv2.putText(annotated, name, (x1, max(y1 - 10, 15)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
         overlay_height = 120
         overlay = np.zeros((overlay_height, frame.shape[1], 3), dtype=np.uint8)
-        overlay[:] = (40, 40, 40)  # Dark gray background
-        
-        # Statistics text
+        overlay[:] = (40, 40, 40)
+
         y_offset = 25
-        line_height = 22
-        
         stats_text = [
-            f"Frames: {self.stats['frames_processed']}  |  Detections: {self.stats['detections']}",
-            f"Face Recognized: {self.stats['faces_recognized']}  |  Body Matched: {self.stats['body_matches']}  |  Unknown: {self.stats['unknown']}",
-            f"Active Tracks: {len(self.tracker.tracked_objects)}  |  Time: {datetime.now().strftime('%H:%M:%S')}",
+            f"Frames: {self.stats['frames_processed']} | Detections: {self.stats['detections']}",
+            f"Faces: {self.stats['faces_recognized']} | Body: {self.stats['body_matches']} | Unknown: {self.stats['unknown']}",
+            f"Active Tracks: {len(self.tracker.tracked_objects)} | Time: {datetime.now().strftime('%H:%M:%S')}",
         ]
-        
         for i, text in enumerate(stats_text):
-            cv2.putText(overlay, text, (10, y_offset + i * line_height),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-        
-        # Add system name
+            cv2.putText(overlay, text, (10, y_offset + i * 22),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+
         cv2.putText(overlay, "Person Tracking System", (10, 100),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
         cv2.putText(overlay, "Press 'q' to quit | 's' for stats | 'r' to reset",
-                   (frame.shape[1] - 450, 100),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-        
-        # Combine overlay with frame
-        result = np.vstack([overlay, annotated])
-        
-        return result
-    
-    def print_statistics(self):
-        """Print detailed statistics."""
-        print("\n" + "=" * 60)
-        print("SYSTEM STATISTICS")
-        print("=" * 60)
-        print(f"Frames Processed:    {self.stats['frames_processed']}")
-        print(f"Total Detections:    {self.stats['detections']}")
-        print(f"Face Recognized:     {self.stats['faces_recognized']}")
-        print(f"Body Matched:        {self.stats['body_matches']}")
-        print(f"Unknown:             {self.stats['unknown']}")
-        print(f"Active Tracks:       {len(self.tracker.tracked_objects)}")
-        print()
-        
-        # Show active sessions
-        active_sessions = self.db.get_active_sessions()
-        print(f"Active Sessions ({len(active_sessions)}):")
-        for session in active_sessions:
-            print(f"  {session['user']:15} | Track: {session['track_id']:3} | "
-                  f"Start: {session['start_time']} | End: {session['end_time']}")
-        
-        # Show today's completed sessions
-        today_sessions = self.db.get_sessions_by_date()
-        completed = [s for s in today_sessions if s['status'] == 'completed']
-        print(f"\nCompleted Sessions Today ({len(completed)}):")
-        for session in completed:
-            duration_min = session['duration'] // 60 if session['duration'] else 0
-            duration_sec = session['duration'] % 60 if session['duration'] else 0
-            print(f"  {session['user']:15} | {session['start_time']} - {session['end_time']} | "
-                  f"Duration: {duration_min}m {duration_sec}s")
-        
-        print("=" * 60 + "\n")
-    
-    def reset_statistics(self):
-        """Reset statistics counters."""
-        self.stats = {
-            'frames_processed': 0,
-            'detections': 0,
-            'faces_recognized': 0,
-            'body_matches': 0,
-            'unknown': 0
-        }
-        print("\n[RESET] Statistics reset")
-    
+                    (frame.shape[1] - 450, 100),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+
+        return np.vstack([overlay, annotated])
+
     def run(self):
-        """
-        Main processing loop.
-        """
         if not self.start_camera():
             return
-        
-        print("\nStarting main processing loop...")
-        print("Controls:")
-        print("  'q' - Quit")
-        print("  's' - Show statistics")
-        print("  'r' - Reset statistics")
-        print()
-        
-        self.running = True
-        fps_counter = 0
-        fps_start_time = time.time()
+
+        print("\nStarting main loop...")
+        print("Controls: 'q' - Quit | 's' - Stats | 'r' - Reset\n")
+
+        fps_counter, fps_start = 0, time.time()
         current_fps = 0
-        
+        self.running = True
+
         try:
             while self.running:
-                # Read frame
                 success, frame = self.cap.read()
-                
                 if not success:
-                    print("Failed to read frame, retrying...")
-                    time.sleep(0.1)
+                    print("Frame read failed.")
                     continue
-                
+
                 self.stats['frames_processed'] += 1
                 fps_counter += 1
-                
-                # Calculate FPS every second
-                if time.time() - fps_start_time > 1.0:
-                    current_fps = fps_counter / (time.time() - fps_start_time)
-                    fps_counter = 0
-                    fps_start_time = time.time()
-                
-                # Track objects
+
+                if time.time() - fps_start > 1.0:
+                    current_fps = fps_counter / (time.time() - fps_start)
+                    fps_counter, fps_start = 0, time.time()
+
                 detections = self.tracker.process_frame(frame)
-                
-                # Process detections (face recognition + logging)
                 if detections:
                     self.process_detections(detections)
-                
-                # Periodic cleanup
+
                 self.cleanup_inactive_tracks()
-                
-                # Draw UI
+
                 display_frame = self.draw_ui(frame, detections)
-                
-                # Add FPS
-                cv2.putText(display_frame, f"FPS: {current_fps:.1f}", (10, display_frame.shape[0] - 10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                
-                # Display
+                cv2.putText(display_frame, f"FPS: {current_fps:.1f}",
+                            (10, display_frame.shape[0] - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
                 cv2.imshow("Person Tracking System", display_frame)
-                
-                # Handle keypresses
                 key = cv2.waitKey(1) & 0xFF
+
                 if key == ord('q'):
-                    print("\nShutting down...")
+                    print("Exiting system...")
                     break
                 elif key == ord('s'):
                     self.print_statistics()
                 elif key == ord('r'):
                     self.reset_statistics()
-        
-        except KeyboardInterrupt:
-            print("\n\nInterrupted by user")
-        
         finally:
             self.stop()
-    
+
+    def print_statistics(self):
+        print("=" * 50)
+        print("SYSTEM STATISTICS")
+        for k, v in self.stats.items():
+            print(f"{k:20}: {v}")
+        print("=" * 50)
+
+    def reset_statistics(self):
+        for k in self.stats:
+            self.stats[k] = 0
+        print("[RESET] Statistics reset.")
+
     def stop(self):
-        """Clean up resources."""
         self.running = False
-        
-        # Finalize all active sessions
-        print("\nFinalizing active sessions...")
-        active_sessions = self.db.get_active_sessions()
-        for session in active_sessions:
-            self.db.finalize_entry(session['id'])
-        
-        # Release camera
         if self.cap:
             self.cap.release()
-        
         cv2.destroyAllWindows()
-        
-        # Print final statistics
-        self.print_statistics()
-        
-        print("System stopped successfully")
+        print("System stopped successfully.")
 
 
 def main():
-    """
-    Entry point for the integrated system.
-    """
-    parser = argparse.ArgumentParser(description="Integrated Person Tracking System")
-    parser.add_argument("--yolo-model", type=str, default="best.pt",
-                       help="Path to YOLO model")
-    parser.add_argument("--face-model", type=str, default="keras_model.h5",
-                       help="Path to face recognition model")
-    parser.add_argument("--labels", type=str, default="labels.txt",
-                       help="Path to labels file")
-    parser.add_argument("--db", type=str, default="presence_log.db",
-                       help="Path to database file")
-    parser.add_argument("--threshold", type=int, default=30,
-                       help="Re-appearance threshold in seconds")
-    parser.add_argument("--camera", type=int, default=0,
-                       help="Camera device index")
-    parser.add_argument("--cleanup-interval", type=int, default=60,
-                       help="Cleanup interval in seconds")
-    
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--yolo-model", default="best.pt")
+    parser.add_argument("--face-model", default="keras_model.h5")
+    parser.add_argument("--labels", default="labels.txt")
+    parser.add_argument("--db", default="presence_log.db")
+    parser.add_argument("--threshold", type=int, default=30)
+    parser.add_argument("--camera", type=int, default=0)
+    parser.add_argument("--cleanup-interval", type=int, default=60)
     args = parser.parse_args()
-    
-    # Create and run system
+
     system = IntegratedSystem(
         yolo_model_path=args.yolo_model,
         face_model_path=args.face_model,
@@ -378,7 +265,6 @@ def main():
         cleanup_interval=args.cleanup_interval,
         camera_index=args.camera
     )
-    
     system.run()
 
 
