@@ -10,7 +10,6 @@ from ultralytics import YOLO
 from typing import Dict, List, Tuple, Optional
 import time
 
-
 class ObjectTracker:
     """
     Handles object detection and tracking using YOLO11 model.
@@ -27,28 +26,26 @@ class ObjectTracker:
         self.model = YOLO(model_path)
         self.conf_threshold = conf_threshold
         self.tracked_objects = {}  # track_id -> last_seen_time
+        self.previous_track_ids = set()  # Track IDs from previous frame
         
-    def process_frame(self, frame: np.ndarray, persist: bool = True) -> List[Dict]:
+    def process_frame(self, frame: np.ndarray, persist: bool = True) -> Tuple[List[Dict], List[int]]:
         """
-        Process a single frame and return tracked objects.
+        Process a single frame and return tracked objects and lost tracks.
         
         Args:
             frame: Input BGR frame from camera
             persist: Whether to persist tracks across frames
             
         Returns:
-            List of dictionaries containing:
-                - track_id: Unique ID for the tracked object
-                - bbox: [x1, y1, x2, y2] bounding box coordinates
-                - confidence: Detection confidence score
-                - class_id: Object class ID
-                - class_name: Object class name
-                - cropped_img: Cropped image of the detection
+            Tuple of:
+            - List of dictionaries containing detection data
+            - List of track IDs that were lost (not seen in this frame)
         """
         # Run YOLO tracking
         results = self.model.track(frame, persist=persist, conf=self.conf_threshold, verbose=False)
         
         tracked_detections = []
+        current_track_ids = set()
         current_time = time.time()
         
         if results and len(results) > 0:
@@ -86,9 +83,16 @@ class ObjectTracker:
                     }
                     
                     tracked_detections.append(detection_data)
+                    current_track_ids.add(int(track_id))
                     self.tracked_objects[track_id] = current_time
         
-        return tracked_detections
+        # Detect lost tracks (tracks that were present before but not in current frame)
+        lost_track_ids = list(self.previous_track_ids - current_track_ids)
+        
+        # Update previous track IDs for next frame
+        self.previous_track_ids = current_track_ids
+        
+        return tracked_detections, lost_track_ids
     
     def get_annotated_frame(self, frame: np.ndarray, detections: List[Dict]) -> np.ndarray:
         """
@@ -111,9 +115,6 @@ class ObjectTracker:
             
             # Draw bounding box
             cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            
-            # Draw label
-            pass
         
         return annotated
     

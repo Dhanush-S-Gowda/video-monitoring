@@ -1,31 +1,29 @@
 """
-Database Manager Module
-Handles SQLite database operations for logging person presence.
-Implements 30-second threshold logic for handling re-appearances.
+Simplified Database Manager
+Simple logging of entry and exit times for each detection.
+No threshold logic - every detection is logged separately.
 """
 
 import sqlite3
-from datetime import datetime, timezone, timedelta
-from typing import Optional, Dict, List, Tuple
-from pathlib import Path
+from datetime import datetime
+from typing import Optional, List, Dict
 import threading
 
 
 class DatabaseManager:
     """
     Manages SQLite database for person presence logging.
+    Simple entry/exit logging without complex threshold logic.
     """
     
-    def __init__(self, db_path: str = "presence_log.db", reappear_threshold: int = 30):
+    def __init__(self, db_path: str = "presence_log.db"):
         """
         Initialize database manager.
         
         Args:
             db_path: Path to SQLite database file
-            reappear_threshold: Threshold in seconds for considering re-appearances
         """
         self.db_path = db_path
-        self.reappear_threshold = reappear_threshold
         self.lock = threading.Lock()
         
         # Initialize database
@@ -37,26 +35,25 @@ class DatabaseManager:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
             
-            # Main presence log table
+            # Simple presence log table
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS presence_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    date TEXT NOT NULL,
-                    user TEXT NOT NULL,
-                    start_time TEXT NOT NULL,
-                    end_time TEXT,
+                    identity TEXT NOT NULL,
+                    track_id INTEGER NOT NULL,
+                    entry_time TEXT NOT NULL,
+                    exit_time TEXT,
                     duration INTEGER,
-                    track_id INTEGER,
-                    status TEXT DEFAULT 'active',
+                    date TEXT NOT NULL,
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT DEFAULT CURRENT_TIMESTAMP
                 )
             """)
             
-            # Index for faster lookups
+            # Indexes for faster lookups
             cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_user_status 
-                ON presence_log(user, status)
+                CREATE INDEX IF NOT EXISTS idx_identity 
+                ON presence_log(identity)
             """)
             
             cursor.execute("""
@@ -64,15 +61,9 @@ class DatabaseManager:
                 ON presence_log(date)
             """)
             
-            # Tracking information table (maps track_id to user)
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS track_mapping (
-                    track_id INTEGER PRIMARY KEY,
-                    user TEXT NOT NULL,
-                    last_seen TEXT NOT NULL,
-                    presence_log_id INTEGER,
-                    FOREIGN KEY (presence_log_id) REFERENCES presence_log(id)
-                )
+                CREATE INDEX IF NOT EXISTS idx_track_id 
+                ON presence_log(track_id)
             """)
             
             conn.commit()
@@ -80,254 +71,157 @@ class DatabaseManager:
             
         print(f"Database initialized at {self.db_path}")
     
-    def _get_current_datetime(self) -> Tuple[str, str]:
+    def _get_current_datetime(self) -> tuple:
         """
-        Get current date and time as strings.
+        Get current date and datetime as strings.
         
         Returns:
-            Tuple of (date_str, time_str)
+            Tuple of (date_str, datetime_str)
         """
         now = datetime.now()
         date_str = now.strftime("%Y-%m-%d")
-        time_str = now.strftime("%H:%M:%S")
-        return date_str, time_str
+        datetime_str = now.strftime("%Y-%m-%d %H:%M:%S")
+        return date_str, datetime_str
     
-    def _get_datetime_obj(self, date_str: str, time_str: str) -> datetime:
+    def log_entry(self, identity: str, track_id: int) -> int:
         """
-        Convert date and time strings to datetime object.
+        Log a person entry (detection started).
         
         Args:
-            date_str: Date string in YYYY-MM-DD format
-            time_str: Time string in HH:MM:SS format
-            
-        Returns:
-            datetime object
-        """
-        return datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M:%S")
-    
-    def log_detection(self, user: str, track_id: int) -> int:
-        """
-        Log a person detection. Handles re-appearances within threshold.
-        
-        Args:
-            user: User name/identity
+            identity: Person's identity (name or "Guest")
             track_id: Track ID from object tracker
             
         Returns:
-            presence_log_id of the created or updated entry
+            Entry ID (primary key)
         """
         with self.lock:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
             
-            date_str, time_str = self._get_current_datetime()
-            current_time = self._get_datetime_obj(date_str, time_str)
-            
-            # Check if track_id already has an active mapping
-            cursor.execute("""
-                SELECT user, last_seen, presence_log_id
-                FROM track_mapping
-                WHERE track_id = ?
-            """, (track_id,))
-            
-            track_mapping = cursor.fetchone()
-            
-            if track_mapping:
-                # Track exists, update last_seen
-                mapped_user, last_seen_str, presence_log_id = track_mapping
-                
-                cursor.execute("""
-                    UPDATE track_mapping
-                    SET last_seen = ?, user = ?
-                    WHERE track_id = ?
-                """, (time_str, user, track_id))
-                
-                # Update the presence log entry
-                cursor.execute("""
-                    UPDATE presence_log
-                    SET end_time = ?, updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ?
-                """, (time_str, presence_log_id))
-                
-                conn.commit()
-                conn.close()
-                return presence_log_id
-            
-            # Check for recent entry for this user (within threshold)
-            threshold_time = current_time - timedelta(seconds=self.reappear_threshold)
-            threshold_time_str = threshold_time.strftime("%H:%M:%S")
+            date_str, datetime_str = self._get_current_datetime()
             
             cursor.execute("""
-                SELECT id, start_time, end_time
-                FROM presence_log
-                WHERE user = ? AND date = ? AND status = 'active'
-                AND end_time >= ?
-                ORDER BY id DESC
-                LIMIT 1
-            """, (user, date_str, threshold_time_str))
+                INSERT INTO presence_log (identity, track_id, entry_time, date)
+                VALUES (?, ?, ?, ?)
+            """, (identity, track_id, datetime_str, date_str))
             
-            recent_entry = cursor.fetchone()
-            
-            if recent_entry:
-                # Update existing entry (same user re-appeared within threshold)
-                presence_log_id, start_time, end_time = recent_entry
-                
-                cursor.execute("""
-                    UPDATE presence_log
-                    SET end_time = ?, track_id = ?, updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ?
-                """, (time_str, track_id, presence_log_id))
-                
-                # Update track mapping
-                cursor.execute("""
-                    INSERT OR REPLACE INTO track_mapping (track_id, user, last_seen, presence_log_id)
-                    VALUES (?, ?, ?, ?)
-                """, (track_id, user, time_str, presence_log_id))
-                
-                conn.commit()
-                conn.close()
-                return presence_log_id
-            
-            else:
-                # Create new entry (new appearance or beyond threshold)
-                cursor.execute("""
-                    INSERT INTO presence_log (date, user, start_time, end_time, track_id, status)
-                    VALUES (?, ?, ?, ?, ?, 'active')
-                """, (date_str, user, time_str, time_str, track_id))
-                
-                presence_log_id = cursor.lastrowid
-                
-                # Create track mapping
-                cursor.execute("""
-                    INSERT OR REPLACE INTO track_mapping (track_id, user, last_seen, presence_log_id)
-                    VALUES (?, ?, ?, ?)
-                """, (track_id, user, time_str, presence_log_id))
-                
-                conn.commit()
-                conn.close()
-                return presence_log_id
-    
-    def finalize_entry(self, presence_log_id: int):
-        """
-        Finalize a presence log entry by calculating duration and setting status.
-        
-        Args:
-            presence_log_id: ID of the presence log entry
-        """
-        with self.lock:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            cursor.execute("""
-                SELECT date, start_time, end_time
-                FROM presence_log
-                WHERE id = ?
-            """, (presence_log_id,))
-            
-            entry = cursor.fetchone()
-            
-            if entry:
-                date_str, start_time_str, end_time_str = entry
-                
-                start_dt = self._get_datetime_obj(date_str, start_time_str)
-                end_dt = self._get_datetime_obj(date_str, end_time_str)
-                
-                duration = int((end_dt - start_dt).total_seconds())
-                
-                cursor.execute("""
-                    UPDATE presence_log
-                    SET duration = ?, status = 'completed', updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ?
-                """, (duration, presence_log_id))
-                
-                conn.commit()
-            
-            conn.close()
-    
-    def cleanup_inactive_tracks(self, timeout: int = 60):
-        """
-        Clean up track mappings that haven't been seen recently and finalize their entries.
-        
-        Args:
-            timeout: Time in seconds to consider a track inactive
-        """
-        with self.lock:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            date_str, current_time_str = self._get_current_datetime()
-            current_dt = self._get_datetime_obj(date_str, current_time_str)
-            cutoff_dt = current_dt - timedelta(seconds=timeout)
-            cutoff_time_str = cutoff_dt.strftime("%H:%M:%S")
-            
-            # Find inactive tracks
-            cursor.execute("""
-                SELECT track_id, presence_log_id
-                FROM track_mapping
-                WHERE last_seen < ?
-            """, (cutoff_time_str,))
-            
-            inactive_tracks = cursor.fetchall()
-            
-            for track_id, presence_log_id in inactive_tracks:
-                # Finalize the presence log entry
-                self.finalize_entry(presence_log_id)
-                
-                # Remove track mapping
-                cursor.execute("""
-                    DELETE FROM track_mapping
-                    WHERE track_id = ?
-                """, (track_id,))
+            entry_id = cursor.lastrowid
             
             conn.commit()
             conn.close()
             
-            if inactive_tracks:
-                print(f"Cleaned up {len(inactive_tracks)} inactive tracks")
+            return entry_id
     
-    def get_active_sessions(self) -> List[Dict]:
+    def log_exit(self, entry_id: int):
         """
-        Get all currently active presence sessions.
+        Log a person exit (track lost).
         
-        Returns:
-            List of active session dictionaries
+        Args:
+            entry_id: Entry ID from log_entry
+        """
+        with self.lock:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            _, exit_datetime_str = self._get_current_datetime()
+            
+            # Get entry time to calculate duration
+            cursor.execute("""
+                SELECT entry_time
+                FROM presence_log
+                WHERE id = ?
+            """, (entry_id,))
+            
+            result = cursor.fetchone()
+            
+            if result:
+                entry_time_str = result[0]
+                
+                # Calculate duration in seconds
+                entry_time = datetime.strptime(entry_time_str, "%Y-%m-%d %H:%M:%S")
+                exit_time = datetime.strptime(exit_datetime_str, "%Y-%m-%d %H:%M:%S")
+                duration = int((exit_time - entry_time).total_seconds())
+                
+                # Update exit time and duration
+                cursor.execute("""
+                    UPDATE presence_log
+                    SET exit_time = ?, duration = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                """, (exit_datetime_str, duration, entry_id))
+                
+                conn.commit()
+            
+            conn.close()
+    
+    def update_identity(self, entry_id: int, new_identity: str):
+        """
+        Update the identity for an entry.
+        Useful when a "Guest" is later recognized.
+        
+        Args:
+            entry_id: Entry ID to update
+            new_identity: New identity name
         """
         with self.lock:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
             
             cursor.execute("""
-                SELECT id, date, user, start_time, end_time, track_id
+                UPDATE presence_log
+                SET identity = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (new_identity, entry_id))
+            
+            conn.commit()
+            conn.close()
+    
+    def get_all_entries(self, limit: int = 100) -> List[Dict]:
+        """
+        Get recent entries.
+        
+        Args:
+            limit: Maximum number of entries to return
+            
+        Returns:
+            List of entry dictionaries
+        """
+        with self.lock:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                SELECT id, identity, track_id, entry_time, exit_time, duration, date
                 FROM presence_log
-                WHERE status = 'active'
                 ORDER BY id DESC
-            """)
+                LIMIT ?
+            """, (limit,))
             
             rows = cursor.fetchall()
             conn.close()
             
-            sessions = []
+            entries = []
             for row in rows:
-                sessions.append({
+                entries.append({
                     'id': row[0],
-                    'date': row[1],
-                    'user': row[2],
-                    'start_time': row[3],
-                    'end_time': row[4],
-                    'track_id': row[5]
+                    'identity': row[1],
+                    'track_id': row[2],
+                    'entry_time': row[3],
+                    'exit_time': row[4],
+                    'duration': row[5],
+                    'date': row[6]
                 })
             
-            return sessions
+            return entries
     
-    def get_sessions_by_date(self, date: Optional[str] = None) -> List[Dict]:
+    def get_entries_by_date(self, date: Optional[str] = None) -> List[Dict]:
         """
-        Get all sessions for a specific date.
+        Get all entries for a specific date.
         
         Args:
             date: Date string in YYYY-MM-DD format (defaults to today)
             
         Returns:
-            List of session dictionaries
+            List of entry dictionaries
         """
         if date is None:
             date = datetime.now().strftime("%Y-%m-%d")
@@ -337,36 +231,83 @@ class DatabaseManager:
             cursor = conn.cursor()
             
             cursor.execute("""
-                SELECT id, date, user, start_time, end_time, duration, status
+                SELECT id, identity, track_id, entry_time, exit_time, duration, date
                 FROM presence_log
                 WHERE date = ?
-                ORDER BY start_time DESC
+                ORDER BY entry_time DESC
             """, (date,))
             
             rows = cursor.fetchall()
             conn.close()
             
-            sessions = []
+            entries = []
             for row in rows:
-                sessions.append({
+                entries.append({
                     'id': row[0],
-                    'date': row[1],
-                    'user': row[2],
-                    'start_time': row[3],
-                    'end_time': row[4],
+                    'identity': row[1],
+                    'track_id': row[2],
+                    'entry_time': row[3],
+                    'exit_time': row[4],
                     'duration': row[5],
-                    'status': row[6]
+                    'date': row[6]
                 })
             
-            return sessions
+            return entries
     
-    def get_user_total_time(self, user: str, date: Optional[str] = None) -> int:
+    def get_entries_by_identity(self, identity: str, date: Optional[str] = None) -> List[Dict]:
         """
-        Get total time (in seconds) for a user on a specific date.
+        Get all entries for a specific identity.
         
         Args:
-            user: User name
-            date: Date string in YYYY-MM-DD format (defaults to today)
+            identity: Person's identity
+            date: Optional date filter in YYYY-MM-DD format
+            
+        Returns:
+            List of entry dictionaries
+        """
+        with self.lock:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            if date:
+                cursor.execute("""
+                    SELECT id, identity, track_id, entry_time, exit_time, duration, date
+                    FROM presence_log
+                    WHERE identity = ? AND date = ?
+                    ORDER BY entry_time DESC
+                """, (identity, date))
+            else:
+                cursor.execute("""
+                    SELECT id, identity, track_id, entry_time, exit_time, duration, date
+                    FROM presence_log
+                    WHERE identity = ?
+                    ORDER BY entry_time DESC
+                """, (identity,))
+            
+            rows = cursor.fetchall()
+            conn.close()
+            
+            entries = []
+            for row in rows:
+                entries.append({
+                    'id': row[0],
+                    'identity': row[1],
+                    'track_id': row[2],
+                    'entry_time': row[3],
+                    'exit_time': row[4],
+                    'duration': row[5],
+                    'date': row[6]
+                })
+            
+            return entries
+    
+    def get_total_time(self, identity: str, date: Optional[str] = None) -> int:
+        """
+        Get total time (in seconds) for a person.
+        
+        Args:
+            identity: Person's identity
+            date: Optional date filter in YYYY-MM-DD format (defaults to today)
             
         Returns:
             Total duration in seconds
@@ -381,64 +322,106 @@ class DatabaseManager:
             cursor.execute("""
                 SELECT SUM(duration)
                 FROM presence_log
-                WHERE user = ? AND date = ? AND duration IS NOT NULL
-            """, (user, date))
+                WHERE identity = ? AND date = ? AND duration IS NOT NULL
+            """, (identity, date))
             
             result = cursor.fetchone()
             conn.close()
             
             return result[0] if result[0] else 0
+    
+    def get_active_entries(self) -> List[Dict]:
+        """
+        Get all entries that don't have an exit time yet.
+        
+        Returns:
+            List of active entry dictionaries
+        """
+        with self.lock:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                SELECT id, identity, track_id, entry_time, date
+                FROM presence_log
+                WHERE exit_time IS NULL
+                ORDER BY entry_time DESC
+            """)
+            
+            rows = cursor.fetchall()
+            conn.close()
+            
+            entries = []
+            for row in rows:
+                entries.append({
+                    'id': row[0],
+                    'identity': row[1],
+                    'track_id': row[2],
+                    'entry_time': row[3],
+                    'date': row[4]
+                })
+            
+            return entries
 
 
 def main():
     """
-    Demo/test the database manager.
+    Demo/test the simplified database manager.
     """
-    db = DatabaseManager(db_path="test_presence.db", reappear_threshold=30)
+    import time
     
-    print("Database Manager Demo")
-    print("-" * 50)
+    db = DatabaseManager(db_path="test_presence_simple.db")
+    
+    print("Simplified Database Manager Demo")
+    print("-" * 60)
     
     # Simulate some detections
-    print("\n1. Logging first detection for Alice (track_id=1)")
-    log_id = db.log_detection("Alice", track_id=1)
-    print(f"   Created log entry ID: {log_id}")
-    
-    import time
-    time.sleep(2)
-    
-    print("\n2. Logging continued detection for Alice (track_id=1)")
-    log_id = db.log_detection("Alice", track_id=1)
-    print(f"   Updated log entry ID: {log_id}")
-    
-    print("\n3. Logging detection for Bob (track_id=2)")
-    log_id2 = db.log_detection("Bob", track_id=2)
-    print(f"   Created log entry ID: {log_id2}")
+    print("\n1. Logging entry for Alice (track_id=1)")
+    entry_id_1 = db.log_entry("Alice", track_id=1)
+    print(f"   Entry ID: {entry_id_1}")
     
     time.sleep(2)
     
-    print("\n4. Simulating Alice leaving and returning within 30 seconds")
+    print("\n2. Logging entry for Bob (track_id=2)")
+    entry_id_2 = db.log_entry("Bob", track_id=2)
+    print(f"   Entry ID: {entry_id_2}")
+    
     time.sleep(2)
-    log_id = db.log_detection("Alice", track_id=3)
-    print(f"   Should reuse log entry ID: {log_id}")
     
-    print("\n5. Active sessions:")
-    sessions = db.get_active_sessions()
-    for session in sessions:
-        print(f"   {session}")
+    print("\n3. Logging entry for Guest (track_id=3)")
+    entry_id_3 = db.log_entry("Guest", track_id=3)
+    print(f"   Entry ID: {entry_id_3}")
     
-    print("\n6. Finalizing entries")
-    db.finalize_entry(log_id)
-    db.finalize_entry(log_id2)
+    time.sleep(1)
     
-    print("\n7. Today's sessions:")
-    today_sessions = db.get_sessions_by_date()
-    for session in today_sessions:
-        print(f"   {session}")
+    print("\n4. Updating Guest to Charlie")
+    db.update_identity(entry_id_3, "Charlie")
+    print("   Identity updated")
     
-    print("\n8. Total time for Alice today:")
-    total = db.get_user_total_time("Alice")
+    time.sleep(2)
+    
+    print("\n5. Logging exits")
+    db.log_exit(entry_id_1)
+    db.log_exit(entry_id_2)
+    db.log_exit(entry_id_3)
+    print("   All exits logged")
+    
+    print("\n6. Today's entries:")
+    entries = db.get_entries_by_date()
+    for entry in entries:
+        print(f"   {entry}")
+    
+    print("\n7. Total time for Alice today:")
+    total = db.get_total_time("Alice")
     print(f"   {total} seconds")
+    
+    print("\n8. Active entries:")
+    active = db.get_active_entries()
+    if active:
+        for entry in active:
+            print(f"   {entry}")
+    else:
+        print("   No active entries")
 
 
 if __name__ == "__main__":

@@ -16,7 +16,6 @@ from object_tracker import ObjectTracker
 from face_recognition_module import FaceRecognitionModule
 from database_manager import DatabaseManager
 
-
 class IntegratedSystem:
     def __init__(self,
                  yolo_model_path="best.pt",
@@ -25,7 +24,7 @@ class IntegratedSystem:
                  db_path="presence_log.db",
                  reappear_threshold=30,
                  cleanup_interval=60,
-                 camera_index=0):
+                 video_url="http://192.168.1.9:8000/video_feed"):
         print("Initializing Integrated Person Tracking System...")
         print("=" * 60)
 
@@ -40,16 +39,12 @@ class IntegratedSystem:
             labels_path=labels_path
         )
 
-        # Load labels (map IDs to names)
-        print("Loading Labels...")
-        self.labels = self._load_labels(labels_path)
-
         # Database Manager
         print("Initializing Database Manager...")
         self.db = DatabaseManager(db_path=db_path, reappear_threshold=reappear_threshold)
 
-        # Camera
-        self.camera_index = camera_index
+        # Video stream
+        self.video_url = video_url
         self.cap = None
 
         # Settings
@@ -71,26 +66,14 @@ class IntegratedSystem:
         print("=" * 60)
         print("System initialized successfully!\n")
 
-    def _load_labels(self, labels_path):
-        """Load label names from labels.txt"""
-        try:
-            with open(labels_path, 'r') as f:
-                labels = [line.strip() for line in f.readlines() if line.strip()]
-            print(f"Loaded {len(labels)} labels: {labels}")
-            return labels
-        except Exception as e:
-            print(f"Error loading labels file: {e}")
-            return []
-
     def start_camera(self):
-        self.cap = cv2.VideoCapture(self.camera_index)
+        # Use HTTP video feed instead of local camera
+        self.cap = cv2.VideoCapture(self.video_url)
         if not self.cap.isOpened():
-            print(f"Error: Cannot open camera at index {self.camera_index}")
+            print(f"Error: Cannot open video stream from {self.video_url}")
             return False
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        self.cap.set(cv2.CAP_PROP_FPS, 30)
-        print("Camera opened successfully")
+        # Note: Setting properties may not work with HTTP streams
+        print(f"Video stream from {self.video_url} opened successfully")
         return True
 
     def process_detections(self, detections):
@@ -115,24 +98,21 @@ class IntegratedSystem:
             elif method == 'unknown':
                 self.stats['unknown'] += 1
 
-            # Map identity (ID) to name if found
-            display_name = "Unknown"
-            if identity is not None and isinstance(identity, int) and 0 <= identity < len(self.labels):
-                display_name = self.labels[identity]
-            elif isinstance(identity, str):
-                display_name = identity
+            # Identity is already the name string from face recognition module
+            display_name = identity if identity else "Unknown"
 
-            # Log detection if identified
-            if identity:
-                try:
-                    self.db.log_detection(display_name, track_id)
-                    print(f"[LOG] Track {track_id} -> {display_name} ({method})")
-                except Exception as e:
-                    print(f"Error logging detection: {e}")
-            else:
-                print(f"[TRACK] Track {track_id} -> Unknown person ({method})")
+            # Prepare a DB-safe user identifier. For truly unknown faces we append the track_id
+            # to avoid merging different unknown people under the same 'Unknown' label.
+            db_user = display_name if identity else f"Unknown_{track_id}"
 
-            # Draw name on bounding box (in ObjectTracker or here)
+            # Always log the detection (including unknowns)
+            try:
+                presence_id = self.db.log_detection(db_user, track_id)
+                print(f"[LOG] Track {track_id} -> {db_user} ({method}) -> Entry {presence_id}")
+            except Exception as e:
+                print(f"Error logging detection: {e}")
+
+            # Draw user-friendly name on bounding box (keep it simple for UI)
             det['display_name'] = display_name
 
     def cleanup_inactive_tracks(self):
@@ -194,6 +174,14 @@ class IntegratedSystem:
                     print("Frame read failed.")
                     continue
 
+                # Convert BGR (OpenCV) frame to RGB for model processing
+                # Keep original `frame` (BGR) for display/drawing to avoid color swaps
+                try:
+                    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                except Exception:
+                    # If conversion fails for any reason, fall back to original frame
+                    rgb_frame = frame
+
                 self.stats['frames_processed'] += 1
                 fps_counter += 1
 
@@ -201,12 +189,21 @@ class IntegratedSystem:
                     current_fps = fps_counter / (time.time() - fps_start)
                     fps_counter, fps_start = 0, time.time()
 
-                detections = self.tracker.process_frame(frame)
+                # Pass RGB frame into tracker/recognition pipeline
+                detections, lost_tracks = self.tracker.process_frame(rgb_frame)
+                
+                # Process active detections
                 if detections:
                     self.process_detections(detections)
+                
+                # Process lost tracks (mark exits)
+                if lost_tracks:
+                    for track_id in lost_tracks:
+                        self.db.mark_exit(track_id)
 
                 self.cleanup_inactive_tracks()
 
+                # Draw UI on the original BGR frame so colors are correct for OpenCV display
                 display_frame = self.draw_ui(frame, detections)
                 cv2.putText(display_frame, f"FPS: {current_fps:.1f}",
                             (10, display_frame.shape[0] - 10),
@@ -252,7 +249,7 @@ def main():
     parser.add_argument("--labels", default="labels.txt")
     parser.add_argument("--db", default="presence_log.db")
     parser.add_argument("--threshold", type=int, default=30)
-    parser.add_argument("--camera", type=int, default=0)
+    parser.add_argument("--video-url", default="http://10.125.32.71:8000/video_feed")
     parser.add_argument("--cleanup-interval", type=int, default=60)
     args = parser.parse_args()
 
@@ -263,7 +260,7 @@ def main():
         db_path=args.db,
         reappear_threshold=args.threshold,
         cleanup_interval=args.cleanup_interval,
-        camera_index=args.camera
+        video_url=args.video_url
     )
     system.run()
 

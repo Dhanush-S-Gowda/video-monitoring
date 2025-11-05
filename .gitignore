@@ -218,4 +218,11 @@ __marimo__/
 Face_Recognition_System/
 images/
 presence_log.db
-keras_model.h5
+.h5
+
+dataset/
+tf210/
+
+class_names.txt
+labels.txt
+
