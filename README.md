@@ -16,6 +16,12 @@
       </a>
     </td>
     <td align="center">
+      <a href="https://github.com/bhuvanlord0602">
+      <img src="https://avatars.githubusercontent.com/bhuvanlord0602" width="50px;" alt="bhuvanlord0602"/><br />
+      <b>bhuvanlord0602</b>
+      </a>
+    </td>
+    <td align="center">
       <a href="https://github.com/JAIPREET-18">
       <img src="https://avatars.githubusercontent.com/JAIPREET-18" width="50px;" alt="JAIPREET-18"/><br />
       <b>JAIPREET-18</b>
